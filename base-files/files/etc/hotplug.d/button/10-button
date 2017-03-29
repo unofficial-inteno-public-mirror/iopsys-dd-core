@@ -1,0 +1,165 @@
+#!/bin/sh
+
+. /lib/functions.sh
+. /usr/share/libubox/jshn.sh
+
+wifibutton_action() {
+	local wldisabled="$(uci -q get wireless.$1.disabled)"
+	wldisabled=${wldisabled:-0}
+	if [ "$wldisabled" == "1" ]; then
+		uci -q set wireless.$1.disabled=0
+	else
+		uci -q set wireless.$1.disabled=1
+	fi
+	uci commit wireless
+	killall -9 wifi 2>/dev/null
+	/sbin/wifi reload &
+}
+
+wpsbutton_action () {
+	enable_wps() {
+		local ifname mode wps_pbc
+		config_get ifname "$1" ifname
+		config_get mode "$1" mode "1"
+		config_get wps_pbc "$1" wps_pbc "1"
+		if [ "$mode" == "ap" -a "$wps_pbc" == "1" -a -n "$ifname" ] ; then
+			iwpriv $ifname set WscConfMode=4
+			iwpriv $ifname set WscConfStatus=2
+			iwpriv $ifname set WscMode=2
+			iwpriv $ifname set WscGetConf=1
+		fi
+	}
+	config_load wireless
+	config_foreach enable_wps wifi-iface
+}
+
+get_wifi_wet_info() {
+	local opt="$1"
+	opt="${opt:-ifname}"
+	handle_interface() {
+		config_get mode "$1" mode
+		if [ "$mode" == "wet" -o "$mode" == "sta" ] ; then
+			config_get val "$1" $opt
+			echo "$val"
+		fi
+	}
+	config_load wireless
+	config_foreach handle_interface wifi-iface "$device"
+}
+
+activate_wps_enrollee() {
+	local apclif="$(get_wifi_wet_info ifname)"
+
+	iwpriv $apclif set ApCliEnable=0
+	iwpriv $apclif set WscConfMode=1
+	iwpriv $apclif set WscMode=2
+	iwpriv $apclif set ApCliEnable=1	
+	iwpriv $apclif set WscGetConf=1
+}
+
+wpscbutton_action () {
+	local wanbaseif="eth0.2"
+	local cur_mode=$(uci -q get netmode.setup.curmode)
+	local wet_iface wet_ssid carrier fl link
+	local wps_paired=0
+	local tm=0
+
+	link=$(swconfig dev switch0 port 0 get link | awk '{print$2}' | cut -d':' -f2)
+
+	if [ "$link" == "up" ]; then
+		activate_wps_enrollee
+		return
+	fi
+
+	case "$cur_mode" in
+	repeater*)
+		activate_wps_enrollee
+	;;
+	*)
+		ubus call leds set  '{"state" : "allflash"}'
+
+		echo "Switching to 'repeater' mode" > /dev/console
+
+		mkdir -p /tmp/netmode_config_backup
+		cp -af /etc/config/* /tmp/netmode_config_backup/
+
+		uci set netmode.setup.curmode="repeater_mtk_5g_up_dual_down"
+		uci set netmode.repeater.reboot="0"
+		uci commit netmode
+		/etc/init.d/netmode reload
+
+		echo "Restarting network services" > /dev/console
+		ubus call network reload
+		wifi reload nodat
+		sleep 5
+		ubus call router.network reload
+
+		ubus call leds set  '{"state" : "normal"}'
+
+		echo "Starting WPS PBC client mode" > /dev/console
+		activate_wps_enrollee
+		ubus -t 120 listen wifi.wps | \
+		while read event; do
+			json_load "$event"
+			json_select wifi.wps
+			json_get_var state state
+			if [ "$state" == "success" ]; then
+				touch /tmp/repeater_mode_success
+				break
+			fi
+		done
+		ubus call led.wps set  '{"state" : "off"}'
+
+		[ -f /tmp/repeater_mode_success ] && {
+			rm -f /tmp/repeater_mode_success
+			return
+		}
+
+		ubus call leds set  '{"state" : "allflash"}'
+		echo "Could not switch to 'repeater' mode; going back to '$cur_mode' mode" > /dev/console
+		uci set netmode.setup.curmode="$cur_mode"
+		cp -af /tmp/netmode_config_backup/* /etc/config/
+		rm -rf /tmp/netmode_config_backup
+
+		echo "Restarting network services" > /dev/console
+		ubus call network reload
+		wifi reload
+		ubus call router.network reload
+		ubus call leds set  '{"state" : "normal"}'
+	;;
+	esac
+}
+
+case "$ACTION" in
+        add|register)
+		[ "resetbutton" == "$INTERFACE" ] && {
+			printf "\n\nReset button is pressed\n\n" > /dev/console
+			/sbin/defaultreset
+		}
+		[ "wifi_2g" == "$INTERFACE" ] && {
+			printf "\n\nWiFi 2.4G button is pressed\n\n" > /dev/console
+			wifibutton_action ra0
+		}
+		[ "wifi_5g" == "$INTERFACE" ] && {
+			printf "\n\nWiFi 5G button is pressed\n\n" > /dev/console
+			wifibutton_action rai0
+		}
+		[ "wpsbutton" == "$INTERFACE" ] && {
+			[ -e "/tmp/wps_active" ] && return
+			touch /tmp/wps_active
+			printf "\n\nWPS button is pressed\n\n" > /dev/console
+			wpsbutton_action
+			rm /tmp/wps_active
+		}
+		[ "wpscbutton" == "$INTERFACE" ] && {
+			[ -e "/tmp/wps_active" ] && return
+			touch /tmp/wps_active
+			printf "\n\nWPS client button is pressed\n\n" > /dev/console
+			wpscbutton_action
+			rm /tmp/wps_active
+		}
+
+        ;;
+        remove|unregister)
+        ;;
+esac

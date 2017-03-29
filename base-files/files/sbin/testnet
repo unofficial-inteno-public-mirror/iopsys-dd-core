@@ -1,0 +1,129 @@
+#!/bin/sh
+
+local netcon=0
+local tvcon=0
+local wanip=0
+
+local timed_check IFACE
+if [ "$1" == "timed_check" ];then
+	timed_check=1
+else
+	IFACE=$1
+fi
+
+
+test_connection() {
+	local addr="$1"
+	local defroute="$(ip r | grep default | awk '{print$3}' | head -1)"
+	local def6route="$(ip -f inet6 r | grep default | awk '{print$3}')"
+	local ping6dev="$(ip -f inet6 r | grep default | awk '{print$5}')"
+
+	if [ -n "$addr" ]; then
+		ping -q -w 5 -c 1 $addr >/dev/null 2>&1 && return 0
+	elif [ -n "$defroute" ]; then
+		ping -q -w 5 -c 1 $defroute >/dev/null 2>&1 && return 0
+		for nmsrv in $(grep nameserver /var/resolv.conf.auto | awk '{print$2}'); do
+			ping -q -w 5 -c 1 $nmsrv >/dev/null 2>&1 && return 0
+		done
+	elif [ -n "$def6route" ] && [ -n "$ping6dev" ]; then
+		ndisc6 -w 5 -1 $def6route $ping6dev >/dev/null 2>&1 && return 0
+	fi
+	return 1
+}
+
+wan_have_ip() {
+	[ -d /sys/class/net/$port ] || return
+	ubus list led.wan >/dev/null 2>&1 || return
+
+	local port="eth0.2"
+	local addr=$(ip a show dev $port | grep "inet "| awk '{print $2}')
+
+	if [ -n "$addr" ]; then
+		wanip=1
+		ubus call led.wan  set '{"state" : "ok"}'
+	else
+		wanip=0
+	fi
+	# don't set wan here status is set from hotplug, only set when ip is detected.
+}
+
+internet_test() {
+	local link=$(swconfig dev switch0 port 0 get link | awk '{print$2}' | cut -d':' -f2)
+
+	[ "$link" == "down" ] && {
+		ubus call led.internet  set '{"state" : "off"}'
+		echo "{ \"online\" : false }" > /tmp/internet_connection_status
+		return
+	}
+
+	local dest="$(uci -q get system.@system[0].netping_addr)"
+
+	test_connection $dest
+
+	if [ "$?" -eq 0 ]; then
+		netcon=1
+		ubus call led.internet  set '{"state" : "ok"}'
+		echo "{ \"online\" : true }" > /tmp/internet_connection_status
+	else
+		netcon=0
+		ubus call led.internet  set '{"state" : "error"}'
+		echo "{ \"online\" : false }" > /tmp/internet_connection_status
+	fi
+}
+
+iptvtest() {
+	ubus list led.ext >/dev/null 2>&1 && tvcon=1 || return
+
+	local dest="$(uci -q get system.@system[0].tvping_addr)"
+
+	test_connection $dest
+
+	if [ "$?" -eq 0 ]; then
+		tvcon=1
+		[ -n "$dest" ] && ubus call led.ext  set '{"state" : "ok"}'
+	else
+		tvcon=0
+		[ -n "$dest" ] && ubus call led.ext  set '{"state" : "off"}'
+	fi
+}
+
+if [ -n "$timed_check" ]
+then
+	internet_test
+	if [ $netcon -eq 1 ]; then
+		ubus send internet '{"status" : "online"}'
+	else
+		ubus send internet '{"status" : "offline"}'
+	fi
+	return 0
+fi
+
+netmode_check() {
+	local curmode="$(uci -q get netmode.setup.curmode)"
+	local uplinkband="$(uci -q get netmode.$curmode.uplink_band)"
+
+	echo "$uplinkband"
+}
+
+
+ubus call led.internet  set '{"enable" : 1}'
+
+while true; do
+	if [ -z "$(netmode_check)" ]; then
+		internet_test
+
+		if [ $netcon -eq 1 ]; then
+			ubus send internet '{"status" : "online"}'
+		else
+			ubus send internet '{"status" : "offline"}'
+		fi
+	else
+		[ $(pidof wificontrol | wc -w) -eq 1 ] || {
+			killall -15 wificontrol >/dev/null 2>&1
+			sleep 1
+			wificontrol -s &
+		}
+	fi
+
+	sleep 5
+done
